@@ -1,193 +1,287 @@
 import socket
 import threading
+import sqlite3
 import logging
-import os
+import argparse
 import time
+import re
+from contextlib import closing
 
-# ================= CONFIG =================
-PORT = int(os.getenv("PORT", "65530"))
-BANK_IP = os.getenv("BANK_IP", None)
-TIMEOUT = int(os.getenv("TIMEOUT", "5"))  # seconds
+# =========================
+# CONFIG
+# =========================
+SOCKET_TIMEOUT = 5
+CLIENT_TIMEOUT = 30
+DB_FILE = "bank.db"
 
-# ================= LOGGING =================
+ACCOUNT_RE = re.compile(r"^(\d{5})/(\d{1,3}(?:\.\d{1,3}){3})$")
+NUMBER_RE = re.compile(r"^\d+$")
+
+lock = threading.Lock()
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     filename="bank.log",
     level=logging.INFO,
-    format="%(asctime)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 
-def log(msg):
-    logging.info(msg)
+# =========================
+# DATABASE
+# =========================
+def init_db():
+    with sqlite3.connect(DB_FILE) as db:
+        db.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            account INTEGER PRIMARY KEY,
+            balance INTEGER NOT NULL
+        )
+        """)
 
-# ================= STORAGE =================
-# accounts = { 10001: balance }
-accounts = {}
-accounts_lock = threading.Lock()
+# =========================
+# BANK CORE
+# =========================
+class Bank:
+    def __init__(self, ip):
+        self.ip = ip
+        init_db()
 
-# ================= HELPERS =================
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+    def create_account(self):
+        with lock, sqlite3.connect(DB_FILE) as db:
+            for acc in range(10000, 100000):
+                if not db.execute(
+                    "SELECT 1 FROM accounts WHERE account=?",
+                    (acc,)
+                ).fetchone():
+                    db.execute(
+                        "INSERT INTO accounts(account,balance) VALUES (?,0)",
+                        (acc,)
+                    )
+                    return acc
+        raise RuntimeError("Nelze vytvořit účet")
 
-if BANK_IP is None:
-    BANK_IP = get_local_ip()
+    def deposit(self, acc, amount):
+        with lock, sqlite3.connect(DB_FILE) as db:
+            r = db.execute(
+                "SELECT balance FROM accounts WHERE account=?",
+                (acc,)
+            ).fetchone()
+            if not r:
+                raise ValueError("Účet neexistuje")
+            db.execute(
+                "UPDATE accounts SET balance=? WHERE account=?",
+                (r[0] + amount, acc)
+            )
 
-def error(msg):
-    return f"ER {msg}"
+    def withdraw(self, acc, amount):
+        with lock, sqlite3.connect(DB_FILE) as db:
+            r = db.execute(
+                "SELECT balance FROM accounts WHERE account=?",
+                (acc,)
+            ).fetchone()
+            if not r:
+                raise ValueError("Účet neexistuje")
+            if r[0] < amount:
+                raise ValueError("Není dostatek finančních prostředků")
+            db.execute(
+                "UPDATE accounts SET balance=? WHERE account=?",
+                (r[0] - amount, acc)
+            )
 
-def valid_account(n):
-    return isinstance(n, int) and 10000 <= n <= 99999
+    def balance(self, acc):
+        with sqlite3.connect(DB_FILE) as db:
+            r = db.execute(
+                "SELECT balance FROM accounts WHERE account=?",
+                (acc,)
+            ).fetchone()
+            if not r:
+                raise ValueError("Účet neexistuje")
+            return r[0]
 
-def valid_amount(n):
-    return isinstance(n, int) and 0 <= n <= 9223372036854775807
+    def remove(self, acc):
+        with lock, sqlite3.connect(DB_FILE) as db:
+            r = db.execute(
+                "SELECT balance FROM accounts WHERE account=?",
+                (acc,)
+            ).fetchone()
+            if not r:
+                raise ValueError("Účet neexistuje")
+            if r[0] != 0:
+                raise ValueError("Nelze smazat účet se zůstatkem")
+            db.execute("DELETE FROM accounts WHERE account=?", (acc,))
 
-def parse_account(text):
-    try:
-        acc_str, ip = text.split("/")
-        acc = int(acc_str)
-        if ip != BANK_IP:
-            return None
-        if not valid_account(acc):
-            return None
-        return acc
-    except Exception:
-        return None
+    def total_amount(self):
+        with sqlite3.connect(DB_FILE) as db:
+            return db.execute("SELECT COALESCE(SUM(balance),0) FROM accounts").fetchone()[0]
 
-# ================= COMMAND HANDLER =================
-def handle_command(line):
-    parts = line.strip().split()
-    if not parts:
-        return None
+    def client_count(self):
+        with sqlite3.connect(DB_FILE) as db:
+            return db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
 
-    cmd = parts[0]
+# =========================
+# P2P COMMUNICATION
+# =========================
+def send_command(ip, port, cmd):
+    with closing(socket.socket()) as s:
+        s.settimeout(SOCKET_TIMEOUT)
+        s.connect((ip, port))
+        s.sendall((cmd + "\n").encode())
+        return s.recv(4096).decode().strip()
 
-    try:
-        if cmd == "BC":
-            return f"BC {BANK_IP}"
+# =========================
+# COMMAND HANDLER
+# =========================
+class Handler:
+    def __init__(self, bank, port):
+        self.bank = bank
+        self.port = port
 
-        elif cmd == "AC":
-            with accounts_lock:
-                for acc in range(10000, 100000):
-                    if acc not in accounts:
-                        accounts[acc] = 0
-                        return f"AC {acc}/{BANK_IP}"
-            return error("Nelze vytvořit nový účet.")
+    def handle(self, line):
+        try:
+            cmd = line.strip()
+            if not cmd:
+                return "ER Prázdný příkaz"
 
-        elif cmd == "AD":
-            if len(parts) != 3:
-                return error("Špatný formát příkazu.")
-            acc = parse_account(parts[1])
-            amount = int(parts[2]) if parts[2].isdigit() else -1
-            if acc is None or not valid_amount(amount):
-                return error("Číslo účtu nebo částka není ve správném formátu.")
-            with accounts_lock:
-                if acc not in accounts:
-                    return error("Účet neexistuje.")
-                accounts[acc] += amount
-            return "AD"
+            code = cmd[:2].upper()
 
-        elif cmd == "AW":
-            if len(parts) != 3:
-                return error("Špatný formát příkazu.")
-            acc = parse_account(parts[1])
-            amount = int(parts[2]) if parts[2].isdigit() else -1
-            if acc is None or not valid_amount(amount):
-                return error("Číslo účtu nebo částka není ve správném formátu.")
-            with accounts_lock:
-                if acc not in accounts:
-                    return error("Účet neexistuje.")
-                if accounts[acc] < amount:
-                    return error("Není dostatek finančních prostředků.")
-                accounts[acc] -= amount
-            return "AW"
+            if code == "BC":
+                return f"BC {self.bank.ip}"
 
-        elif cmd == "AB":
-            if len(parts) != 2:
-                return error("Špatný formát příkazu.")
-            acc = parse_account(parts[1])
-            if acc is None:
-                return error("Formát čísla účtu není správný.")
-            with accounts_lock:
-                if acc not in accounts:
-                    return error("Účet neexistuje.")
-                return f"AB {accounts[acc]}"
+            if code == "AC":
+                acc = self.bank.create_account()
+                return f"AC {acc}/{self.bank.ip}"
 
-        elif cmd == "AR":
-            if len(parts) != 2:
-                return error("Špatný formát příkazu.")
-            acc = parse_account(parts[1])
-            if acc is None:
-                return error("Formát čísla účtu není správný.")
-            with accounts_lock:
-                if acc not in accounts:
-                    return error("Účet neexistuje.")
-                if accounts[acc] != 0:
-                    return error("Nelze smazat bankovní účet na kterém jsou finance.")
-                del accounts[acc]
-            return "AR"
+            if code in ("AD", "AW", "AB", "AR"):
+                parts = cmd.split()
+                if len(parts) < 2:
+                    return "ER Špatný formát"
 
-        elif cmd == "BA":
-            with accounts_lock:
-                total = sum(accounts.values())
-            return f"BA {total}"
+                m = ACCOUNT_RE.match(parts[1])
+                if not m:
+                    return "ER Formát čísla účtu není správný"
 
-        elif cmd == "BN":
-            with accounts_lock:
-                return f"BN {len(accounts)}"
+                acc = int(m.group(1))
+                ip = m.group(2)
 
-        else:
-            return error("Nepovolený příkaz.")
+                # PROXY
+                if ip != self.bank.ip:
+                    return send_command(ip, self.port, cmd)
 
-    except Exception as e:
-        log(f"ERROR {e}")
-        return error("Chyba v aplikaci, zkuste to později.")
+                if code == "AB":
+                    return f"AB {self.bank.balance(acc)}"
 
-# ================= CLIENT HANDLER =================
-def handle_client(conn, addr):
-    conn.settimeout(TIMEOUT)
-    log(f"CLIENT CONNECTED {addr[0]}")
+                if len(parts) != 3:
+                    return "ER Chybí částka"
 
-    try:
-        buffer = ""
-        while True:
-            data = conn.recv(1024)
-            if not data:
+                if not NUMBER_RE.match(parts[2]):
+                    return "ER Částka není číslo"
+
+                amount = int(parts[2])
+
+                if code == "AD":
+                    self.bank.deposit(acc, amount)
+                    return "AD"
+
+                if code == "AW":
+                    self.bank.withdraw(acc, amount)
+                    return "AW"
+
+                if code == "AR":
+                    self.bank.remove(acc)
+                    return "AR"
+
+            if code == "BA":
+                return f"BA {self.bank.total_amount()}"
+
+            if code == "BN":
+                return f"BN {self.bank.client_count()}"
+
+            if code == "RP":
+                target = int(cmd.split()[1])
+                return self.robbery_plan(target)
+
+            return "ER Neznámý příkaz"
+
+        except Exception as e:
+            logging.exception("ERROR")
+            return f"ER {str(e)}"
+
+    # =========================
+    # HACKER PART
+    # =========================
+    def robbery_plan(self, target):
+        banks = []
+
+        for i in range(65525, 65536):
+            try:
+                r1 = send_command(self.bank.ip, i, "BA")
+                r2 = send_command(self.bank.ip, i, "BN")
+                if r1.startswith("BA") and r2.startswith("BN"):
+                    amount = int(r1.split()[1])
+                    clients = int(r2.split()[1])
+                    banks.append((self.bank.ip, amount, clients))
+            except:
+                continue
+
+        banks.sort(key=lambda x: (x[2], -x[1]))
+
+        total = 0
+        victims = 0
+        chosen = []
+
+        for ip, amt, cl in banks:
+            if total >= target:
                 break
-            buffer += data.decode("utf-8")
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                log(f"IN  {line}")
-                response = handle_command(line)
-                log(f"OUT {response}")
-                conn.sendall((response + "\n").encode("utf-8"))
-    except socket.timeout:
-        log("CLIENT TIMEOUT")
-    finally:
-        conn.close()
-        log("CLIENT DISCONNECTED")
+            total += amt
+            victims += cl
+            chosen.append(ip)
 
-# ================= SERVER =================
+        return (
+            f"RP K dosažení {target} je třeba vyloupit banky "
+            + ", ".join(chosen)
+            + f" a bude poškozeno {victims} klientů."
+        )
+
+# =========================
+# SERVER
+# =========================
+def client_thread(conn, handler):
+    conn.settimeout(CLIENT_TIMEOUT)
+    with conn:
+        while True:
+            try:
+                data = conn.recv(1024)
+                if not data:
+                    return
+                resp = handler.handle(data.decode())
+                conn.sendall((resp + "\n").encode())
+            except socket.timeout:
+                return
+
 def main():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("", PORT))
-    server.listen(5)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--ip", default=None)
+    args = parser.parse_args()
 
-    log(f"BANK NODE STARTED {BANK_IP}:{PORT}")
-    print(f"Bank node running on {BANK_IP}:{PORT}")
+    ip = args.ip or socket.gethostbyname(socket.gethostname())
+    bank = Bank(ip)
+    handler = Handler(bank, args.port)
 
-    while True:
-        conn, addr = server.accept()
-        t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-        t.start()
+    with socket.socket() as s:
+        s.bind(("", args.port))
+        s.listen()
+        logging.info(f"Bank node running {ip}:{args.port}")
+
+        while True:
+            conn, _ = s.accept()
+            threading.Thread(
+                target=client_thread,
+                args=(conn, handler),
+                daemon=True
+            ).start()
 
 if __name__ == "__main__":
     main()

@@ -7,13 +7,21 @@ import time
 import re
 from contextlib import closing
 
+from os import getenv
+
 import lib.data_provider.data_provider as dp
 
 # =========================
 # CONFIG
 # =========================
-SOCKET_TIMEOUT = 5
-CLIENT_TIMEOUT = 30
+SOCKET_TIMEOUT = getenv("SOCKET_TIMEOUT", 5)
+CLIENT_TIMEOUT = getenv("CLIENT_TIMEOUT", 30)
+DB_SERVER = getenv("DB_SERVER", 'localhost')
+DATABASE = getenv("DB_NAME", 'bank_db')
+DB_TABLE = getenv("DB_TABLE", 'accounts')
+DB_UID = getenv("DB_UID", 'admin')
+DB_PWD = getenv("DB_PWD", 'password')
+DB_DRIVER = getenv("DB_DRIVER")
 DB_FILE = "bank.db"
 
 ACCOUNT_RE = re.compile(r"^(\d{5})/(\d{1,3}(?:\.\d{1,3}){3})$")
@@ -48,59 +56,41 @@ def init_db():
 class Bank:
     def __init__(self, ip):
         self.ip = ip
-        init_db()
+        self.dat_prov = dp
+        self.dat_prov.set_connection_data({'uid': DB_UID, 'pwd': DB_PWD, 'server': DB_SERVER, 'driver': DB_DRIVER})
 
     def create_account(self):
-        with lock, sqlite3.connect(DB_FILE) as db:
-            for acc in range(10000, 100000):
-                if not db.execute(
-                    "SELECT 1 FROM accounts WHERE account=?",
-                    (acc,)
-                ).fetchone():
-                    db.execute(
-                        "INSERT INTO accounts(account,balance) VALUES (?,0)",
-                        (acc,)
-                    )
-                    return acc
+        for acc in range(10000, 100000):
+            if self.dat_prov.get_value_in_column_by_id(DB_TABLE, 'id', acc) != None:
+                self.dat_prov.insert(DB_TABLE, ('id', 'balance'), (acc, 0))
+                return
         raise RuntimeError("Nelze vytvořit účet")
 
     def deposit(self, acc, amount):
-        with lock, sqlite3.connect(DB_FILE) as db:
-            r = db.execute(
-                "SELECT balance FROM accounts WHERE account=?",
-                (acc,)
-            ).fetchone()
-            if not r:
-                raise ValueError("Účet neexistuje")
-            db.execute(
-                "UPDATE accounts SET balance=? WHERE account=?",
-                (r[0] + amount, acc)
+        self.dat_prov.set_value_in_column_by_id(
+            DB_TABLE, 
+            'balance', 
+            acc, 
+            self.dat_prov.get_value_in_column_by_id(DB_TABLE,'balance', acc) + amount
             )
 
     def withdraw(self, acc, amount):
-        with lock, sqlite3.connect(DB_FILE) as db:
-            r = db.execute(
-                "SELECT balance FROM accounts WHERE account=?",
-                (acc,)
-            ).fetchone()
-            if not r:
-                raise ValueError("Účet neexistuje")
-            if r[0] < amount:
-                raise ValueError("Není dostatek finančních prostředků")
-            db.execute(
-                "UPDATE accounts SET balance=? WHERE account=?",
-                (r[0] - amount, acc)
-            )
+        result = self.dat_prov.get_value_in_column_by_id(DB_TABLE,'balance', acc) - amount
+        if result < 0:
+            raise ValueError('Not enough money')
+        self.dat_prov.set_value_in_column_by_id(
+            DB_TABLE,
+            'balance',
+            acc,
+            result
+        )
 
     def balance(self, acc):
-        with sqlite3.connect(DB_FILE) as db:
-            r = db.execute(
-                "SELECT balance FROM accounts WHERE account=?",
-                (acc,)
-            ).fetchone()
-            if not r:
-                raise ValueError("Účet neexistuje")
-            return r[0]
+        return self.dat_prov.get_value_in_column_by_id(
+            DB_TABLE,
+            'balance',
+            acc
+        )
 
     def remove(self, acc):
         with lock, sqlite3.connect(DB_FILE) as db:
@@ -115,12 +105,24 @@ class Bank:
             db.execute("DELETE FROM accounts WHERE account=?", (acc,))
 
     def total_amount(self):
-        with sqlite3.connect(DB_FILE) as db:
-            return db.execute("SELECT COALESCE(SUM(balance),0) FROM accounts").fetchone()[0]
+        result = 0
+        for i in range(10_000, 100_000):
+            result += int(self.dat_prov.get_value_in_column_by_id(
+                DB_TABLE,
+                'balance',
+                i
+            ))
+        return result
 
     def client_count(self):
-        with sqlite3.connect(DB_FILE) as db:
-            return db.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        result = 0
+        for i in range(10_000, 100_000):
+            if self.dat_prov.get_value_in_column_by_id(
+                DB_TABLE,
+                'id',
+                i
+            ) > 1000:
+                result+=1
 
 # =========================
 # P2P COMMUNICATION

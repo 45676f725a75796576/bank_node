@@ -1,0 +1,3 @@
+[submodule "lib/data_provider"]
+	path = lib/data_provider
+	url = https://github.com/45676f725a75796576/data_provider

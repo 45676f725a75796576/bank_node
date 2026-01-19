@@ -7,6 +7,8 @@ import time
 import re
 from contextlib import closing
 
+import lib.data_provider.data_provider as dp
+
 # =========================
 # CONFIG
 # =========================

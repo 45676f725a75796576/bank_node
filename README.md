@@ -1,5 +1,12 @@
 # BANK P2P NODE
 
+**Author:** Yegor Zuyev  
+**Email:** egor.zuyev33@gmail.com  
+**Institution:** SPŠE Ječná, Praha 2  
+**Project Task:** Peer-to-peer project
+
+---
+
 ## Setup
 
 ### Database setup

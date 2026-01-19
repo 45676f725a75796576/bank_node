@@ -141,6 +141,33 @@ class Handler:
     def __init__(self, bank, port):
         self.bank = bank
         self.port = port
+        self.commands = {
+            'BC': self.bc,
+            'AC': self.ac
+        }
+        
+    def bc(self, cmd: str):
+        return f"BC {self.bank.ip}"
+    
+    def ac(self, cmd: str):
+        acc = self.bank.create_account()
+        return f"AC {acc}/{self.bank.ip}"
+    
+    def ab(self, cmd: str):
+        parts = cmd.split()
+        
+        if len(parts) < 2:
+            return "ER Špatný formát"
+        m = ACCOUNT_RE.match(parts[1])
+        if not m:
+            return "ER Formát čísla účtu není správný"
+        acc = int(m.group(1))
+        ip = m.group(2)
+        # PROXY
+        if ip != self.bank.ip:
+            return send_command(ip, self.port, cmd)
+        
+        return f"AB {self.bank.balance(acc)}"
 
     def handle(self, line):
         try:
@@ -150,12 +177,7 @@ class Handler:
 
             code = cmd[:2].upper()
 
-            if code == "BC":
-                return f"BC {self.bank.ip}"
-
-            if code == "AC":
-                acc = self.bank.create_account()
-                return f"AC {acc}/{self.bank.ip}"
+            return self.commands[code](cmd)
 
             if code in ("AD", "AW", "AB", "AR"):
                 parts = cmd.split()
